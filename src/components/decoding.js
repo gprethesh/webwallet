@@ -1,0 +1,241 @@
+const bs58 = (await import("bs58")).default;
+const ec = (await import("elliptic")).default;
+
+const ENDIAN = "le";
+const CURVE_NAME = "p256";
+
+const AddressFormat = {
+  FULL_HEX: "hex",
+  COMPRESSED: "compressed",
+};
+
+const ecInstance = new ec.ec(CURVE_NAME);
+
+function bigintToBytes(num, length, endian) {
+  if (length < 1 || length > 32) {
+    throw new Error("Length must be between 1 and 32");
+  }
+
+  const result = new Uint8Array(length);
+
+  if (endian === "le") {
+    for (let i = 0; i < length; i++) {
+      result[i] = Number(num & 0xffn);
+      num >>= 8n;
+    }
+  } else if (endian === "big") {
+    for (let i = length - 1; i >= 0; i--) {
+      result[i] = Number(num & 0xffn);
+      num >>= 8n;
+    }
+  } else {
+    throw new Error('Invalid endian. Use "little" or "big".');
+  }
+
+  if (num !== 0n) {
+    throw new Error("Integer too large to convert to bytes");
+  }
+
+  return result;
+}
+
+function pointToBytes(point, addressFormat = AddressFormat.FULL_HEX) {
+  if (addressFormat === AddressFormat.FULL_HEX) {
+    return Buffer.concat([
+      Buffer.from(point.getX().toArray(ENDIAN, 32)),
+      Buffer.from(point.getY().toArray(ENDIAN, 32)),
+    ]);
+  } else if (addressFormat === AddressFormat.COMPRESSED) {
+    return stringToBytes(pointToString(point, AddressFormat.COMPRESSED));
+  } else {
+    throw new Error("Not Implemented");
+  }
+}
+
+function pointToString(point, addressFormat = AddressFormat.COMPRESSED) {
+  switch (addressFormat) {
+    case AddressFormat.FULL_HEX:
+      const pointBytes = pointToBytes(point);
+      return pointBytes.toString("hex");
+
+    case AddressFormat.COMPRESSED:
+      const x = BigInt(point.getX().toString(10, 64));
+      console.log("Before x : ", x);
+      const y = BigInt(point.getY().toString(10, 64));
+      console.log("Before y : ", y);
+      const specifier = y % 2n === 0n ? 42 : 43;
+
+      const address = bs58.encode(
+        Buffer.concat([
+          Buffer.from([specifier]),
+          Buffer.from(bigintToBytes(x, 32, ENDIAN)),
+        ])
+      );
+
+      return address;
+
+    default:
+      throw new Error("Not Implemented");
+  }
+}
+
+function bytesToBigInt(bytes, endian) {
+  let result = 0n;
+  if (endian === "le") {
+    for (let i = bytes.length - 1; i >= 0; i--) {
+      result <<= 8n;
+      result += BigInt(bytes[i]);
+    }
+  } else if (endian === "big") {
+    for (let i = 0; i < bytes.length; i++) {
+      result <<= 8n;
+      result += BigInt(bytes[i]);
+    }
+  } else {
+    throw new Error('Invalid endian. Use "little" or "big".');
+  }
+  return result;
+}
+
+function legendreSymbol(a, p) {
+  let ls = modPow(a, (p - BigInt(1)) / BigInt(2), p);
+  return ls === BigInt(1)
+    ? BigInt(1)
+    : ls === p - BigInt(1)
+    ? BigInt(-1)
+    : BigInt(0);
+}
+
+function modPow(base, exponent, modulus) {
+  if (modulus === BigInt(1)) return BigInt(0);
+  let result = BigInt(1);
+  base = base % modulus;
+  while (exponent > BigInt(0)) {
+    if (exponent % BigInt(2) === BigInt(1)) result = (result * base) % modulus;
+    exponent = exponent / BigInt(2);
+    base = (base * base) % modulus;
+  }
+  return result;
+}
+
+function tonelliShanks(a, p) {
+  if (legendreSymbol(a, p) !== BigInt(1)) {
+    return [NaN, NaN];
+  }
+
+  let q = p - BigInt(1);
+  let s = BigInt(0);
+  while (q % BigInt(2) === BigInt(0)) {
+    q /= BigInt(2);
+    s += BigInt(1);
+  }
+
+  if (s === BigInt(1)) {
+    return [
+      modPow(a, (p + BigInt(1)) / BigInt(4), p),
+      p - modPow(a, (p + BigInt(1)) / BigInt(4), p),
+    ];
+  }
+
+  let z = BigInt(2);
+  while (legendreSymbol(z, p) !== p - BigInt(1)) {
+    z++;
+  }
+
+  let c = modPow(z, q, p);
+  let r = modPow(a, (q + BigInt(1)) / BigInt(2), p);
+  let t = modPow(a, q, p);
+  let m = s;
+
+  while (true) {
+    if (t === BigInt(1)) {
+      return [r, p - r];
+    }
+
+    let i = BigInt(1);
+    let temp = t;
+    while (temp !== BigInt(1) && i < m) {
+      temp = modPow(t, BigInt(2) ** i, p);
+      i++;
+    }
+
+    let b = modPow(c, BigInt(2) ** (m - i - BigInt(1)), p);
+    r = (r * b) % p;
+    t = (t * b * b) % p;
+    c = (b * b) % p;
+    m = i;
+  }
+}
+
+function yFromX(x, is_odd) {
+  const a = -3n;
+  const b =
+    41058363725152142129326129780047268409114441015993725554835256314039467401291n;
+  const p =
+    115792089210356248762697446949407573530086143415290314195533631308867097853951n;
+  // const a = BigInt(ecInstance.curve.a);
+  // const b = BigInt(ecInstance.curve.b);
+  // const p = BigInt(ecInstance.curve.p);
+  // console.log(a, b, p);
+  x = BigInt(x);
+
+  // Compute y^2 = x^3 + ax + b
+  let y2 = x ** 3n + a * x + b;
+
+  const [y_res, y_mod] = tonelliShanks(y2, p);
+  // console.log(y_res, y_mod);
+  if (y_res % 2n == is_odd) return y_res;
+  else return y_mod;
+}
+
+function stringToPoint(string) {
+  const pointBytes = bs58.decode(string);
+
+  let xBytes, yBytes;
+  switch (pointBytes.length) {
+    case 33:
+      // If the length is 33, it's a compressed point, so we need to decompress it
+      const specifier = pointBytes[0];
+      xBytes = bytesToBigInt(pointBytes.subarray(1), ENDIAN);
+      console.log("After x : ", xBytes);
+      const isOdd = specifier === 0x03 || specifier === 0x02;
+      yBytes = yFromX(xBytes, isOdd);
+      console.log("After y : ", yBytes);
+      break;
+    case 64:
+      // If the length is 64, it's a full point
+      xBytes = pointBytes.subarray(0, 32);
+      yBytes = pointBytes.subarray(32);
+      break;
+    default:
+      throw new Error("Invalid point bytes length");
+  }
+
+  return [xBytes, yBytes];
+}
+
+function generateStaticKeys() {
+  const privateKey =
+    "ff47d5314dcf7c9baf4177f09665e89786c21caf4e3326ade65fe55446b73d53";
+
+  const publicKey = ecInstance.keyFromPrivate(privateKey).getPublic();
+  const address = pointToString(publicKey);
+  const publicKeyHex =
+    "04" +
+    publicKey.getX().toString(16, 64) +
+    publicKey.getY().toString(16, 64);
+
+  const [originalPublicKey_x, originalPublicKey_y] = stringToPoint(address);
+  const originalPublicKeyHex =
+    "04" +
+    originalPublicKey_x.toString(16, 64) +
+    originalPublicKey_y.toString(16, 64);
+
+  console.log(`Private Key: ${privateKey}`);
+  console.log(`Public Key: ${publicKeyHex}`);
+  console.log("Address:", address);
+  console.log("originalPublicKeyHex :", originalPublicKeyHex);
+  // unable to create point from x and y
+}
+
+generateStaticKeys();
